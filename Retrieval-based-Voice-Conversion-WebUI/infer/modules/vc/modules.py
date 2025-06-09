@@ -1,5 +1,12 @@
 import traceback
 import logging
+import time
+import traceback
+import os
+import logging
+from io import BytesIO
+import soundfile as sf
+from infer.lib.audio import wav2
 
 logger = logging.getLogger(__name__)
 
@@ -160,12 +167,15 @@ class VC:
     ):
         if input_audio_path is None:
             return "You need to upload an audio", None
+
         f0_up_key = int(f0_up_key)
+
         try:
             audio = load_audio(input_audio_path, 16000)
             audio_max = np.abs(audio).max() / 0.95
             if audio_max > 1:
                 audio /= audio_max
+
             times = [0, 0, 0]
 
             if self.hubert_model is None:
@@ -173,17 +183,15 @@ class VC:
 
             if file_index:
                 file_index = (
-                    file_index.strip(" ")
+                    file_index.strip()
                     .strip('"')
                     .strip("\n")
-                    .strip('"')
-                    .strip(" ")
                     .replace("trained", "added")
                 )
             elif file_index2:
                 file_index = file_index2
             else:
-                file_index = ""  # 防止小白写错，自动帮他替换掉
+                file_index = ""
 
             audio_opt = self.pipeline.pipeline(
                 self.hubert_model,
@@ -205,24 +213,17 @@ class VC:
                 protect,
                 f0_file,
             )
-            if self.tgt_sr != resample_sr >= 16000:
-                tgt_sr = resample_sr
-            else:
-                tgt_sr = self.tgt_sr
-            index_info = (
-                "Index:\n%s." % file_index
-                if os.path.exists(file_index)
-                else "Index not used."
-            )
-            return (
-                "Success.\n%s\nTime:\nnpy: %.2fs, f0: %.2fs, infer: %.2fs."
-                % (index_info, *times),
-                (tgt_sr, audio_opt),
-            )
+
+            tgt_sr = resample_sr if self.tgt_sr != resample_sr >= 16000 else self.tgt_sr
+
+            return "Success", (tgt_sr, audio_opt)
+
         except:
             info = traceback.format_exc()
             logger.warning(info)
             return info, (None, None)
+
+
 
     def vc_multi(
         self,
@@ -242,63 +243,77 @@ class VC:
         format1,
     ):
         try:
-            dir_path = (
-                dir_path.strip(" ").strip('"').strip("\n").strip('"').strip(" ")
-            )  # 防止小白拷路径头尾带了空格和"和回车
-            opt_root = opt_root.strip(" ").strip('"').strip("\n").strip('"').strip(" ")
-            os.makedirs(opt_root, exist_ok=True)
-            try:
-                if dir_path != "":
-                    paths = [
-                        os.path.join(dir_path, name) for name in os.listdir(dir_path)
-                    ]
-                else:
-                    paths = [path.name for path in paths]
-            except:
-                traceback.print_exc()
-                paths = [path.name for path in paths]
-            infos = []
-            for path in paths:
-                info, opt = self.vc_single(
-                    sid,
-                    path,
-                    f0_up_key,
-                    None,
-                    f0_method,
-                    file_index,
-                    file_index2,
-                    # file_big_npy,
-                    index_rate,
-                    filter_radius,
-                    resample_sr,
-                    rms_mix_rate,
-                    protect,
-                )
-                if "Success" in info:
-                    try:
-                        tgt_sr, audio_opt = opt
-                        if format1 in ["wav", "flac"]:
-                            sf.write(
-                                "%s/%s.%s"
-                                % (opt_root, os.path.basename(path), format1),
-                                audio_opt,
-                                tgt_sr,
+            dir_path = dir_path.strip().strip('"').strip("\n")
+            opt_root = opt_root.strip().strip('"').strip("\n")
+
+            all_infos = []
+
+            for root, _, files in os.walk(dir_path):
+                rel_path = os.path.relpath(root, dir_path)
+                cur_output_dir = os.path.join(opt_root, rel_path)
+
+                # 이미 결과 파일이 존재하면 해당 폴더 건너뜀
+                if os.path.exists(cur_output_dir) and any(
+                    fname.lower().endswith(f".{format1}") for fname in os.listdir(cur_output_dir)
+                ):
+                    print(f"이미 변환된 폴더: {rel_path}, 건너뜀")
+                    continue
+
+                os.makedirs(cur_output_dir, exist_ok=True)
+
+                wav_paths = [os.path.join(root, f) for f in files if f.lower().endswith(".wav")]
+                if not wav_paths:
+                    continue
+
+                infos = []
+
+                for path in wav_paths:
+                    for attempt in range(2):  # 최대 2번 시도
+                        try:
+                            info, opt = self.vc_single(
+                                sid,
+                                path,
+                                f0_up_key,
+                                None,
+                                f0_method,
+                                file_index,
+                                file_index2,
+                                index_rate,
+                                filter_radius,
+                                resample_sr,
+                                rms_mix_rate,
+                                protect,
                             )
-                        else:
-                            path = "%s/%s.%s" % (
-                                opt_root,
-                                os.path.basename(path),
-                                format1,
-                            )
-                            with BytesIO() as wavf:
-                                sf.write(wavf, audio_opt, tgt_sr, format="wav")
-                                wavf.seek(0, 0)
-                                with open(path, "wb") as outf:
-                                    wav2(wavf, outf, format1)
-                    except:
-                        info += traceback.format_exc()
-                infos.append("%s->%s" % (os.path.basename(path), info))
-                yield "\n".join(infos)
-            yield "\n".join(infos)
-        except:
+                            if "Success" in info:
+                                tgt_sr, audio_opt = opt
+                                out_path = os.path.join(
+                                    cur_output_dir,
+                                    os.path.splitext(os.path.basename(path))[0] + f".{format1}",
+                                )
+                                if format1 in ["wav", "flac"]:
+                                    sf.write(out_path, audio_opt, tgt_sr)
+                                else:
+                                    with BytesIO() as wavf:
+                                        sf.write(wavf, audio_opt, tgt_sr, format="wav")
+                                        wavf.seek(0)
+                                        with open(out_path, "wb") as outf:
+                                            wav2(wavf, outf, format1)
+                                break
+                            else:
+                                raise Exception(info)
+                        except Exception as e:
+                            if attempt == 0:
+                                time.sleep(10)  # 실패 후 10초 대기
+                            else:
+                                info = f"{os.path.basename(path)} 변환 실패: {str(e)}"
+
+                    infos.append(f"{os.path.basename(path)} -> {info}")
+                    yield f"{os.path.basename(path)} -> {info}"  # WebUI 출력용
+
+                all_infos.extend(infos)
+                print(f"{rel_path} 폴더 변환 완료")  # Colab에서는 이 줄만 뜸
+
+            print("전체 변환 완료")
+
+        except Exception:
             yield traceback.format_exc()

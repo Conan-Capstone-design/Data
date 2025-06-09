@@ -438,18 +438,35 @@ def change_sr2(sr2, if_f0_3, version19):
 
 def change_version19(sr2, if_f0_3, version19):
     path_str = "" if version19 == "v1" else "_v2"
-    if sr2 == "32k" and version19 == "v1":
-        sr2 = "40k"
-    to_return_sr2 = (
-        {"choices": ["40k", "48k"], "__type__": "update", "value": sr2}
-        if version19 == "v1"
-        else {"choices": ["40k", "48k", "32k"], "__type__": "update", "value": sr2}
-    )
     f0_str = "f0" if if_f0_3 else ""
+
+    # sr2를 무조건 문자열로 강제 변환
+    sr2 = str(sr2).strip()
+
+    # v1은 40k, 48k만 가능
+    if version19 == "v1":
+        available_sr2 = ["40k", "48k"]
+        if sr2 not in available_sr2:
+            sr2 = "32k"  # 강제로 40k 설정
+    else:
+        available_sr2 = ["32k", "40k", "48k"]
+        if sr2 not in available_sr2:
+            sr2 = "32k"  # 기본은 40k로
+
+
+    print("sr2 : ", sr2)
+    print("version19 : ", version19)
+
     return (
         *get_pretrained_models(path_str, f0_str, sr2),
-        to_return_sr2,
+        {
+            "choices": available_sr2,
+            "value": sr2,
+            "__type__": "update",
+        }
     )
+
+
 
 
 def change_f0(if_f0_3, sr2, version19):  # f0method8,pretrained_G14,pretrained_D15
@@ -1177,11 +1194,12 @@ with gr.Blocks(title="RVC WebUI") as app:
             with gr.Row():
                 exp_dir1 = gr.Textbox(label=i18n("输入实验名"), value="mi-test")
                 sr2 = gr.Radio(
-                    label=i18n("目标采样率"),
-                    choices=["40k", "48k"],
-                    value="40k",
-                    interactive=True,
-                )
+   			label=i18n("目标采样率"),
+  			choices=["32k", "40k", "48k"],  # ← 32k 추가
+   			value="32k",  # ← 기본값도 32k로 바꾸고 싶다면 여기 수정
+    			interactive=True,
+		)
+
                 if_f0_3 = gr.Radio(
                     label=i18n("模型是否带音高指导(唱歌一定要, 语音可以不要)"),
                     choices=[True, False],
