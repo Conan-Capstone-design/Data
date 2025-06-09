@@ -1,23 +1,14 @@
-import traceback
-import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
-import traceback
 import os
-import logging
-from io import BytesIO
-import soundfile as sf
-from infer.lib.audio import wav2
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-
-logger = logging.getLogger(__name__)
-
+import math
+import torch
+import logging
+import traceback
 import numpy as np
 import soundfile as sf
-import torch
+import parselmouth
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from infer.lib.audio import load_audio, wav2
 from infer.lib.infer_pack.models import (
@@ -29,6 +20,13 @@ from infer.lib.infer_pack.models import (
 from infer.modules.vc.pipeline import Pipeline
 from infer.modules.vc.utils import *
 
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+logging.getLogger("PIL").setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
+
 
 class VC:
     def __init__(self, config):
@@ -39,10 +37,15 @@ class VC:
         self.cpt = None
         self.version = None
         self.if_f0 = None
-        self.version = None
         self.hubert_model = None
-
         self.config = config
+        self.config.device = torch.device("cuda:5")
+
+    def get_mean_f0(self, wav_path):
+        snd = parselmouth.Sound(str(wav_path))
+        pitch = snd.to_pitch()
+        f0_values = pitch.selected_array['frequency']
+        return np.mean(f0_values[f0_values > 0])
 
     def get_vc(self, sid, *to_return_protect):
         logger.info("Get sid: " + sid)
@@ -63,57 +66,26 @@ class VC:
         }
 
         if sid == "" or sid == []:
-            if (
-                self.hubert_model is not None
-            ):  # 考虑到轮询, 需要加个判断看是否 sid 是由有模型切换到无模型的
+            if self.hubert_model is not None:
                 logger.info("Clean model cache")
-                del (self.net_g, self.n_spk, self.hubert_model, self.tgt_sr)  # ,cpt
-                self.hubert_model = self.net_g = self.n_spk = self.hubert_model = (
-                    self.tgt_sr
-                ) = None
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                ###楼下不这么折腾清理不干净
-                self.if_f0 = self.cpt.get("f0", 1)
-                self.version = self.cpt.get("version", "v1")
-                if self.version == "v1":
-                    if self.if_f0 == 1:
-                        self.net_g = SynthesizerTrnMs256NSFsid(
-                            *self.cpt["config"], is_half=self.config.is_half
-                        )
-                    else:
-                        self.net_g = SynthesizerTrnMs256NSFsid_nono(*self.cpt["config"])
-                elif self.version == "v2":
-                    if self.if_f0 == 1:
-                        self.net_g = SynthesizerTrnMs768NSFsid(
-                            *self.cpt["config"], is_half=self.config.is_half
-                        )
-                    else:
-                        self.net_g = SynthesizerTrnMs768NSFsid_nono(*self.cpt["config"])
-                del self.net_g, self.cpt
+                del self.net_g, self.n_spk, self.hubert_model, self.tgt_sr
+                self.hubert_model = self.net_g = self.n_spk = self.tgt_sr = None
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             return (
                 {"visible": False, "__type__": "update"},
-                {
-                    "visible": True,
-                    "value": to_return_protect0,
-                    "__type__": "update",
-                },
-                {
-                    "visible": True,
-                    "value": to_return_protect1,
-                    "__type__": "update",
-                },
+                {"visible": True, "value": to_return_protect0, "__type__": "update"},
+                {"visible": True, "value": to_return_protect1, "__type__": "update"},
                 "",
                 "",
             )
+
         person = f'{os.getenv("weight_root")}/{sid}'
         logger.info(f"Loading: {person}")
 
         self.cpt = torch.load(person, map_location="cpu")
         self.tgt_sr = self.cpt["config"][-1]
-        self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]  # n_spk
+        self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]
         self.if_f0 = self.cpt.get("f0", 1)
         self.version = self.cpt.get("version", "v1")
 
@@ -175,7 +147,13 @@ class VC:
         if self.pipeline is None:
             self.pipeline = Pipeline(self.tgt_sr, self.config)
 
-        f0_up_key = int(f0_up_key)
+        if f0_up_key in [None, "", "auto"]:
+            speaker_f0 = self.get_mean_f0(input_audio_path)
+            TARGET_F0 = 260.3701554543574
+            f0_up_key = round(math.log2(TARGET_F0 / speaker_f0) * 12 - 1.29)
+            logger.info(f"[Auto Transpose] {input_audio_path} 평균 f0: {round(speaker_f0,2)} Hz → f0_up_key: {f0_up_key}")
+        else:
+            f0_up_key = int(f0_up_key)
 
         try:
             audio = load_audio(input_audio_path, 16000)
@@ -190,10 +168,7 @@ class VC:
 
             if file_index:
                 file_index = (
-                    file_index.strip()
-                    .strip('"')
-                    .strip("\n")
-                    .replace("trained", "added")
+                    file_index.strip().strip('"').strip("\n").replace("trained", "added")
                 )
             elif file_index2:
                 file_index = file_index2
@@ -225,11 +200,10 @@ class VC:
 
             return "Success", (tgt_sr, audio_opt)
 
-        except:
+        except Exception:
             info = traceback.format_exc()
             logger.warning(info)
             return info, (None, None)
-
 
     def vc_multi(
         self,
@@ -263,23 +237,30 @@ class VC:
                 if not wav_paths:
                     continue
 
+                try:
+                    sample_f0 = self.get_mean_f0(wav_paths[0])
+                    ### 타겟 화자의 평균 F0
+                    TARGET_F0 = 260.3701554543574 
+                    local_f0_up_key = round(math.log2(TARGET_F0 / sample_f0) * 12) - 1.29
+                    logger.info(f"[{rel_path}] 평균 f0: {round(sample_f0, 2)} Hz → f0_up_key: {local_f0_up_key}")
+                except Exception as e:
+                    local_f0_up_key = 0
+                    logger.warning(f"[{rel_path}] f0 계산 실패, f0_up_key=0 적용: {e}")
+
                 def process(path):
                     out_path = os.path.join(
                         cur_output_dir,
                         os.path.splitext(os.path.basename(path))[0] + f".{format1}",
                     )
-
-                    # 이미 처리된 경우 건너뛰기
                     if os.path.exists(out_path):
                         return f"{os.path.basename(path)} -> 이미 존재함, 스킵"
 
                     for attempt in range(2):
                         try:
-                            # 오디오 파일을 로드할 때 오류가 발생하면 출력
                             info, opt = self.vc_single(
                                 sid,
                                 path,
-                                f0_up_key,
+                                local_f0_up_key,
                                 None,
                                 f0_method,
                                 file_index,
@@ -307,16 +288,14 @@ class VC:
                             if attempt == 0:
                                 time.sleep(5)
                             else:
-                                # 실패한 파일 출력
                                 return f"{os.path.basename(path)} 변환 실패: {str(e)}"
 
-                # 병렬 처리 시작
-                with ThreadPoolExecutor(max_workers=7) as executor:
+                with ThreadPoolExecutor(max_workers=50) as executor:
                     future_to_path = {executor.submit(process, path): path for path in wav_paths}
                     for future in as_completed(future_to_path):
                         result = future.result()
                         all_infos.append(result)
-                        yield result  # WebUI 출력용
+                        yield result
 
                 print(f"{rel_path} 폴더 변환 완료")
 
@@ -324,6 +303,3 @@ class VC:
 
         except Exception:
             yield traceback.format_exc()
-
-
-
